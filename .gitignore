@@ -1,0 +1,5 @@
+*.docx
+PLAN.md
+__pycache__/
+*.pyc
+*.pyo
