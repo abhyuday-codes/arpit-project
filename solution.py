@@ -19,25 +19,8 @@ def get_conn():
     return conn
 
 
-def step1_raw_count(conn):
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS n
-        FROM communication_log
-        WHERE merchant_id = 501
-          AND communication_type = '2'
-          AND sent_time >= '2026-10-01 00:00:00'
-          AND sent_time <  '2026-11-01 00:00:00'
-        """
-    ).fetchone()
-    return row["n"]
-
-
 def load_campaigns(conn):
-    return {
-        r["id"]: dict(r)
-        for r in conn.execute("SELECT * FROM campaign").fetchall()
-    }
+    return {r["id"]: dict(r) for r in conn.execute("SELECT * FROM campaign").fetchall()}
 
 
 def find_ineligible(campaigns):
@@ -49,8 +32,17 @@ def find_ineligible(campaigns):
     }
 
 
+def find_standalone(campaigns):
+    """Campaigns with no parent AND no children — each send row is its own event."""
+    has_children = {c["parent_id"] for c in campaigns.values() if c["parent_id"] is not None}
+    return {
+        cid
+        for cid, c in campaigns.items()
+        if c["parent_id"] is None and cid not in has_children
+    }
+
+
 def build_root_map(campaigns):
-    """Map every campaign id to its chain root id."""
     root = {}
 
     def get_root(cid):
@@ -65,34 +57,24 @@ def build_root_map(campaigns):
     return root
 
 
-def step2_remove_ineligible(conn, ineligible_ids):
-    placeholders = ",".join("?" * len(ineligible_ids))
-    row = conn.execute(
-        f"""
-        SELECT COUNT(*) AS n
-        FROM communication_log
-        WHERE merchant_id = 501
-          AND communication_type = '2'
-          AND sent_time >= '2026-10-01 00:00:00'
-          AND sent_time <  '2026-11-01 00:00:00'
-          AND communication_id NOT IN ({placeholders})
-        """,
-        list(ineligible_ids),
-    ).fetchone()
-    return row["n"]
+def raw_count(conn):
+    return conn.execute(
+        """
+        SELECT COUNT(*) FROM communication_log
+        WHERE merchant_id = 501 AND communication_type = '2'
+          AND sent_time >= '2026-10-01 00:00:00' AND sent_time < '2026-11-01 00:00:00'
+        """
+    ).fetchone()[0]
 
 
 def eligible_rows(conn, ineligible_ids):
-    placeholders = ",".join("?" * len(ineligible_ids))
+    ph = ",".join("?" * len(ineligible_ids))
     return conn.execute(
         f"""
-        SELECT communication_id, customer_id
-        FROM communication_log
-        WHERE merchant_id = 501
-          AND communication_type = '2'
-          AND sent_time >= '2026-10-01 00:00:00'
-          AND sent_time <  '2026-11-01 00:00:00'
-          AND communication_id NOT IN ({placeholders})
+        SELECT communication_id, customer_id FROM communication_log
+        WHERE merchant_id = 501 AND communication_type = '2'
+          AND sent_time >= '2026-10-01 00:00:00' AND sent_time < '2026-11-01 00:00:00'
+          AND communication_id NOT IN ({ph})
         """,
         list(ineligible_ids),
     ).fetchall()
@@ -115,6 +97,7 @@ def main():
     conn = get_conn()
     campaigns = load_campaigns(conn)
     ineligible_ids = find_ineligible(campaigns)
+    standalone_ids = find_standalone(campaigns)
     root_map = build_root_map(campaigns)
 
     # --- ineligible campaigns ---
@@ -127,70 +110,85 @@ def main():
             f"processing_status='{c['processing_status']}'"
         )
 
-    # --- chain structure ---
-    print("\n[Campaign chain structure]")
-    roots = sorted({v for v in root_map.values()})
-    for root_id in roots:
-        chain = sorted(cid for cid, r in root_map.items() if r == root_id)
-        label = "INELIGIBLE" if root_id in ineligible_ids or any(
-            c in ineligible_ids for c in chain
-        ) else ""
-        print(f"  Root {root_id}: chain = {chain}  {label}")
+    # --- campaign classification ---
+    print("\n[Campaign classification]")
+    for cid in sorted(campaigns):
+        c = campaigns[cid]
+        if cid in ineligible_ids:
+            kind = "INELIGIBLE"
+        elif cid in standalone_ids:
+            kind = "standalone (count all rows)"
+        else:
+            kind = f"chain (root={root_map[cid]}, dedup by customer)"
+        print(f"  Campaign {cid}: {kind}")
 
     # --- reconciliation bridge ---
     print("\n[Reconciliation bridge]\n")
-    header = f"{'Step':<5} {'Description':<55} {'Adj':>6} {'Total':>7}"
-    print(header)
-    print("-" * len(header))
+    hdr = f"{'Step':<5} {'Description':<58} {'Adj':>5} {'Total':>6}"
+    print(hdr)
+    print("-" * len(hdr))
 
-    raw = step1_raw_count(conn)
-    running = raw
-    print(f"{'1':<5} {'Raw rows in communication_log (Oct 2026, type=2)':<55} {'—':>6} {running:>7}")
-
-    after_elig = step2_remove_ineligible(conn, ineligible_ids)
-    adj2 = after_elig - running
-    running = after_elig
-    print(f"{'2':<5} {'Remove ineligible campaign rows (9004 approval_awaiting)':<55} {adj2:>+6} {running:>7}")
+    running = raw_count(conn)
+    print(f"{'1':<5} {'Raw rows in communication_log (Oct 2026, type=2)':<58} {'—':>5} {running:>6}")
 
     rows = eligible_rows(conn, ineligible_ids)
+    adj2 = len(rows) - running
+    running = len(rows)
+    print(f"{'2':<5} {'Remove ineligible campaign 9004 rows (C11–C14)':<58} {adj2:>+5} {running:>6}")
 
-    # Step 3: dedup within each chain (same root, same customer)
-    seen_chain = set()
-    dedup3 = 0
+    # Chain dedup: count distinct (root, customer) per chain campaign
+    chain_seen = set()
+    standalone_count = 0
+    chain_dups = {}  # customer -> list of campaigns seen in
+
     for r in rows:
-        root_id = root_map[r["communication_id"]]
-        key = (root_id, r["customer_id"])
-        if key in seen_chain:
-            dedup3 += 1
+        cid = r["communication_id"]
+        if cid in standalone_ids:
+            standalone_count += 1
         else:
-            seen_chain.add(key)
+            root_id = root_map[cid]
+            key = (root_id, r["customer_id"])
+            chain_seen.add(key)
 
-    running -= dedup3
-    print(f"{'3':<5} {'De-dup customers across retry chains (C2×2, C3×3, D1×2)':<55} {-dedup3:>+6} {running:>7}")
+    # Show individual dedup steps for chain customers
+    # Reconstruct per-customer appearances within each chain
+    from collections import defaultdict
+    chain_appearances = defaultdict(set)  # (root, customer) -> set of campaign ids
+    for r in rows:
+        cid = r["communication_id"]
+        if cid not in standalone_ids:
+            key = (root_map[cid], r["customer_id"])
+            chain_appearances[key].add(cid)
 
-    # Verify step 4 & 5 are implicit in step 3 (chain dedup covers both)
-    # Show the breakdown for transparency
-    chain_a_dedup = sum(
-        1 for r in rows
-        if root_map[r["communication_id"]] == 9001
-        and (9001, r["customer_id"]) in seen_chain
-        # already seen means it's a dup
+    # Group multi-appearance customers by chain root for display
+    multi = [(k, v) for k, v in chain_appearances.items() if len(v) > 1]
+    multi.sort(key=lambda x: (x[0][0], x[0][1]))
+
+    step = 3
+    for (root_id, customer), campaign_set in multi:
+        n = len(campaign_set)
+        adj = -(n - 1)
+        running += adj
+        desc = f"De-dup {customer} in chain {root_id} ({n} campaigns → 1 customer)"
+        print(f"{step:<5} {desc:<58} {adj:>+5} {running:>6}")
+        step += 1
+
+    standalone_label = (
+        f"Standalone 9101: each send is own event — no customer dedup"
     )
+    print(f"{'✅':<5} {standalone_label:<58} {'0':>5} {running:>6}")
 
-    distinct_by_chain = len(seen_chain)
-    adj4_label = "Verify: COUNT(DISTINCT root||customer) from SQL"
+    total = len(chain_seen) + standalone_count
+    print("-" * len(hdr))
+    print(f"\n{'target_base (Python)':>40}: {total}")
+
     sql_result = run_sql_query()
+    print(f"{'target_base (SQL)':>40}: {sql_result}")
 
-    print(f"{'✓':<5} {'Final target_base':<55} {'':>6} {distinct_by_chain:>7}")
-    print("-" * len(header))
-    print(f"\n{'SQL query result':>60}: {sql_result}")
+    assert total == sql_result, f"Mismatch! Python={total}, SQL={sql_result}"
+    assert sql_result == 22, f"Expected 22, got {sql_result}"
 
-    assert distinct_by_chain == sql_result, (
-        f"Mismatch! Python={distinct_by_chain}, SQL={sql_result}"
-    )
-    assert sql_result == 21, f"Expected 21, got {sql_result}"
-
-    print(f"\n{'target_base = 21':>60}")
+    print(f"\n{'target_base = 22':>40}")
     print("\nAll assertions passed.")
     conn.close()
 

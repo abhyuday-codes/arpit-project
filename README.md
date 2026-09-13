@@ -7,16 +7,19 @@
 ## Problem
 
 Given a `campaign` table and a `communication_log` table for a marketing platform, compute
-**`target_base`**: the number of distinct customers reached by a merchant in a given month,
-where a retry chain (campaign A → B → C, linked via `parent_id`) counts as **one underlying
-communication** — so a customer reached at any step of the chain counts only once.
+**`target_base`**: the number of qualifying sends for a merchant in a given month, where:
+
+- A **retry chain** (campaign A → B → C, linked via `parent_id`) counts as one underlying
+  communication — a customer reached at any step of the chain counts **once**.
+- A **standalone** campaign (no parent, no children) treats every send as its own event —
+  the same customer targeted on two different dates counts **twice**.
 
 ---
 
 ## Answer
 
 ```
-target_base = 21
+target_base = 22
 ```
 
 ---
@@ -30,48 +33,55 @@ python solution.py
 Requires Python 3.8+ (stdlib only — `sqlite3`, `pathlib`). Reads from `data/comm_log.db`.
 
 Prints:
-- Which campaigns were excluded by the eligibility gate
-- The full campaign chain structure
-- A step-by-step reconciliation bridge (raw count → 21)
+- Which campaigns are excluded by the eligibility gate
+- Campaign chain/standalone classification
+- A step-by-step reconciliation bridge (raw count → 22)
 - SQL result assertion
 
 To run the SQL query standalone:
 
 ```bash
 sqlite3 data/comm_log.db < query.sql
-# → 21
+# → 22
 ```
 
 ---
 
-## Key Finding
+## Key Findings
 
-**Campaign 9004 ("Diwali Cart Recovery - Retry C") is the critical trap.**
+### 1 — The eligibility trap (campaign 9004)
 
-It is a child of campaign 9001 in the retry chain, so its 4 customers (C11–C14) appear
-in `communication_log` with `delivery_status = 900` (delivered). But the campaign itself
-carries `creation_status = 'approval_awaiting'` — meaning the send pipeline ran before
-approval bookkeeping caught up.
+Campaign 9004 ("Diwali Cart Recovery - Retry C") carries `creation_status = 'approval_awaiting'`
+yet its 4 rows appear in `communication_log` with `delivery_status = 900` (delivered). The send
+pipeline ran before approval bookkeeping caught up. The eligibility gate:
 
-A naive `COUNT(DISTINCT customer_id)` on all delivered rows returns **25**.
-Applying the eligibility gate correctly gives **21**.
+```
+creation_status IN ('approved', 'aborted', 'resumed', 'stopped')
+AND processing_status = 'processed'
+```
 
-This is what makes the problem non-trivial: the data looks clean, the sends were physically
-delivered, and the customers are real — but the campaign is not reportable.
+excludes these 4 customers (C11–C14) entirely. A naive count on delivered rows gives **25**;
+after the eligibility gate it is **26**.
+
+### 2 — Standalone campaigns count rows, not distinct customers
+
+Campaign 9101 is standalone (no parent, no children). Customer C20 was sent on both 2026-10-10
+and 2026-10-20 — two independent re-targeting events, not a retry. Both count toward
+`target_base`. A `COUNT(DISTINCT customer_id)` for this campaign returns 6; the correct
+contribution is **7**.
 
 ---
 
 ## Approach
 
-1. **Eligibility gate** — filter campaigns where `creation_status IN ('approved', 'aborted',
-   'resumed', 'stopped') AND processing_status = 'processed'`. Campaign 9004 is excluded.
+1. **Eligibility gate** — exclude campaigns where `creation_status = 'approval_awaiting'`
+   (or other non-finalized statuses) or `processing_status != 'processed'`.
 
-2. **Chain resolution** — walk `parent_id` links recursively to find the root of each
-   campaign chain. All campaigns in a chain share one `root_id`.
+2. **Chain classification** — walk `parent_id` links recursively to find the root of each chain.
+   Campaigns with no parent and no children are standalone.
 
-3. **Distinct count** — count `DISTINCT (root_id, customer_id)` pairs. This naturally
-   handles both intra-chain dedup (same customer, multiple retry attempts) and
-   standalone re-targeting (same customer, same campaign, different dates).
+3. **Dual counting** — for chain campaigns: `COUNT DISTINCT (root_id, customer_id)`.
+   For standalone campaigns: `COUNT(*)` (every row is its own event).
 
 ---
 
@@ -79,9 +89,9 @@ delivered, and the customers are real — but the campaign is not reportable.
 
 | File | Purpose |
 |---|---|
-| [`query.sql`](query.sql) | Single SQL query (recursive CTE) that returns `target_base = 21` |
+| [`query.sql`](query.sql) | SQL query (recursive CTE + dual count) → `target_base = 22` |
 | [`solution.py`](solution.py) | Step-by-step Python analysis with bridge table and SQL assertion |
-| [`reconciliation_bridge.md`](reconciliation_bridge.md) | Human-readable bridge: raw count → each dedup step → 21 |
+| [`reconciliation_bridge.md`](reconciliation_bridge.md) | Human-readable bridge: raw count → each dedup step → 22 |
 | [`generate_dataset.py`](generate_dataset.py) | Provided — generates the synthetic dataset |
 | [`data/`](data/) | SQLite DB and CSVs |
 
@@ -89,8 +99,8 @@ delivered, and the customers are real — but the campaign is not reportable.
 
 ## Dataset Summary
 
-- 7 campaigns across 3 families + 1 standalone
+- 7 campaigns across 2 retry chains + 1 standalone + 1 ineligible branch
 - 30 raw `communication_log` rows
 - 1 ineligible campaign (9004) · 4 excluded rows
-- 2 retry chains (9001→9002→9003, 9201→9202) · 3 cross-campaign customer dups
-- 1 standalone re-target (C20 in 9101 × 2 dates) · 1 within-campaign dup
+- 2 retry chains (9001→9002→9003, 9201→9202) · 4 cross-campaign customer dups removed
+- 1 standalone re-target (C20 in 9101 × 2 dates) · both sends qualify
